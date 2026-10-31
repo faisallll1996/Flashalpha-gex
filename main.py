@@ -16,7 +16,7 @@ ALLOWED = {"META", "MU", "TSLA", "AMD", "AVGO", "SNDK"}
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "21600"))
 _cache: Dict[str, Any] = {}
 
-app = FastAPI(title="GEX Dashboard", version="3.0.0")
+app = FastAPI(title="GEX Dashboard", version="4.0.0")
 
 
 @app.get("/health")
@@ -75,7 +75,8 @@ async def cached_request(path, key, params=None):
 
     try:
         data = await request_api(path, params)
-        _cache[key] = {"time": now, "data": data}
+        _cache[key] = {"time": time.time(), "data": data}
+
         return {
             **data,
             "proxy_cache_age_seconds": 0,
@@ -102,7 +103,10 @@ async def nearest_expiration(symbol: str):
     else:
         try:
             options = await request_api(f"/v1/options/{symbol}")
-            _cache[cache_key] = {"time": now, "data": options}
+            _cache[cache_key] = {
+                "time": time.time(),
+                "data": options
+            }
         except HTTPException:
             if item:
                 options = item["data"]
@@ -127,6 +131,35 @@ async def nearest_expiration(symbol: str):
         )
 
     return dates[0]
+
+
+@app.get("/cached/{symbol}")
+def cached_gex(symbol: str):
+    symbol = symbol.upper()
+
+    if symbol not in ALLOWED:
+        raise HTTPException(400, "Unsupported symbol.")
+
+    matches = [
+        (key, value)
+        for key, value in _cache.items()
+        if key.startswith(f"gex:{symbol}:")
+    ]
+
+    if not matches:
+        raise HTTPException(
+            404, "No saved GEX data for this symbol yet."
+        )
+
+    key, item = max(matches, key=lambda x: x[1]["time"])
+    age = int(time.time() - item["time"])
+
+    return {
+        **item["data"],
+        "selected_expiration": key.split(":")[-1],
+        "proxy_cache_age_seconds": age,
+        "proxy_stale": age >= CACHE_TTL
+    }
 
 
 @app.get("/expirations/{symbol}")
@@ -200,6 +233,7 @@ h1{font-size:22px;margin:0}
 main{max-width:1100px;margin:auto;padding:15px}
 select,button{background:#18233a;color:white;border:1px solid #34435f;
 border-radius:9px;padding:12px;font-size:15px}
+button{cursor:pointer}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
 #status{font-size:12px;color:#9ba9c2}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
@@ -225,45 +259,81 @@ td:first-child,th:first-child{text-align:left}
 <body>
 <header>
 <h1>GEX Dashboard</h1>
-<div class="sub">Gamma Exposure · Live chart · Cached data</div>
+<div class="sub">Gamma Exposure · TradingView · Cached Data</div>
 </header>
+
 <main>
 <div class="toolbar">
 <select id="ticker">
-<option>META</option><option>MU</option><option>TSLA</option>
-<option>AMD</option><option>AVGO</option><option>SNDK</option>
+<option>META</option>
+<option>MU</option>
+<option>TSLA</option>
+<option>AMD</option>
+<option>AVGO</option>
+<option>SNDK</option>
 </select>
 <button onclick="loadData()">Refresh</button>
-<span id="status">Ready</span>
+<span id="status">Loading saved data...</span>
 </div>
 
 <div id="notice" class="notice"></div>
 
 <div class="grid">
-<div class="card"><small>Underlying Price</small><div class="value" id="price">—</div></div>
-<div class="card"><small>Gamma Flip</small><div class="value" id="flip">—</div></div>
-<div class="card"><small>Net GEX</small><div class="value" id="netgex">—</div></div>
-<div class="card"><small>Expiration</small><div class="value" id="expiry">—</div></div>
+<div class="card">
+<small>Underlying Price</small>
+<div class="value" id="price">—</div>
+</div>
+<div class="card">
+<small>Gamma Flip</small>
+<div class="value" id="flip">—</div>
+</div>
+<div class="card">
+<small>Net GEX</small>
+<div class="value" id="netgex">—</div>
+</div>
+<div class="card">
+<small>Expiration</small>
+<div class="value" id="expiry">—</div>
+</div>
 </div>
 
 <div class="chart">
 <h2 id="chartTitle">META · TradingView</h2>
 <iframe id="tv"
-src="https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3AMETA&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=0&toolbarbg=0b1020&theme=dark&style=1&timezone=Asia%2FRiyadh&withdateranges=1&hideideas=1&studies=%5B%5D"
+src="https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3AMETA&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=0&toolbarbg=0b1020&theme=dark&style=1&timezone=Asia%2FRiyadh&withdateranges=1&hideideas=1"
 allowtransparency="true" scrolling="no"></iframe>
 </div>
 
 <div class="section card">
-<h2>GEX Levels</h2>
+<h2>GEX Strikes</h2>
 <div class="tablewrap">
 <table>
-<thead><tr><th>Strike</th><th>Net GEX</th></tr></thead>
-<tbody id="levels"><tr><td colspan="2">Waiting for data…</td></tr></tbody>
+<thead>
+<tr><th>Strike</th><th>Net GEX</th></tr>
+</thead>
+<tbody id="levels">
+<tr><td colspan="2">No saved data yet.</td></tr>
+</tbody>
 </table>
 </div>
 </div>
+
+<div class="section card">
+<h2>Market Levels</h2>
+<div class="tablewrap">
+<table>
+<thead>
+<tr><th>Level</th><th>Value</th></tr>
+</thead>
+<tbody id="marketLevels">
+<tr><td colspan="2">Not loaded.</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
 <div class="sub" style="padding:15px 2px">
-Data provided by your FlashAlpha API proxy. Not investment advice.
+FlashAlpha data · TradingView chart · Not investment advice.
 </div>
 </main>
 
@@ -281,13 +351,20 @@ function compact(v){
  if(v===null || v===undefined || v==="") return "—";
  const n=Number(v);
  if(!Number.isFinite(n)) return String(v);
- return n.toLocaleString("en-US",{notation:"compact",maximumFractionDigits:2});
+ return n.toLocaleString("en-US",{
+  notation:"compact",
+  maximumFractionDigits:2
+ });
 }
 
 function findRows(data){
- const candidates = [
-  data.strikes, data.rows, data.data, data.exposures,
-  data.gex_by_strike, data.strike_data
+ const candidates=[
+  data.strikes,
+  data.rows,
+  data.data,
+  data.exposures,
+  data.gex_by_strike,
+  data.strike_data
  ];
  for(const item of candidates){
   if(Array.isArray(item)) return item;
@@ -298,69 +375,176 @@ function findRows(data){
 function renderRows(data){
  const rows=findRows(data);
  const body=$("levels");
+
  if(!rows.length){
-  body.innerHTML='<tr><td colspan="2">No strike breakdown found in response.</td></tr>';
+  body.innerHTML='<tr><td colspan="2">No strike breakdown found.</td></tr>';
   return;
  }
+
  const normalized=rows.map(r=>({
   strike:r.strike ?? r.price ?? r.strike_price,
   gex:r.net_gex ?? r.gex ?? r.total_gex ?? r.value
  })).filter(r=>r.strike!==undefined);
+
  normalized.sort((a,b)=>Number(a.strike)-Number(b.strike));
+
  body.innerHTML=normalized.slice(0,30).map(r=>
   `<tr><td>${number(r.strike)}</td><td>${compact(r.gex)}</td></tr>`
  ).join("");
 }
 
+function renderMarketLevels(data){
+ const body=$("marketLevels");
+
+ if(!data || typeof data!=="object"){
+  body.innerHTML='<tr><td colspan="2">No levels available.</td></tr>';
+  return;
+ }
+
+ const entries=Object.entries(data).filter(([key,value])=>
+  !["symbol","proxy_cache_age_seconds","proxy_stale"].includes(key)
+  && (typeof value==="string" || typeof value==="number")
+ );
+
+ if(!entries.length){
+  body.innerHTML='<tr><td colspan="2">No levels available.</td></tr>';
+  return;
+ }
+
+ body.innerHTML=entries.slice(0,20).map(([key,value])=>
+  `<tr><td>${key.replaceAll("_"," ")}</td><td>${number(value)}</td></tr>`
+ ).join("");
+}
+
 function setChart(symbol){
  $("chartTitle").textContent=symbol+" · TradingView";
+
  const url="https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3A"+
  encodeURIComponent(symbol)+
  "&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=0"+
  "&toolbarbg=0b1020&theme=dark&style=1&timezone=Asia%2FRiyadh"+
  "&withdateranges=1&hideideas=1";
+
  $("tv").src=url;
+}
+
+function showGex(data){
+ $("price").textContent=number(data.underlying_price);
+ $("flip").textContent=number(data.gamma_flip);
+ $("netgex").textContent=compact(data.net_gex);
+ $("expiry").textContent=data.selected_expiration || "—";
+ renderRows(data);
+}
+
+async function loadCachedData(){
+ const symbol=$("ticker").value;
+
+ $("status").textContent="Reading saved data...";
+ $("notice").textContent="";
+ $("notice").classList.remove("error");
+
+ setChart(symbol);
+
+ try{
+  const response=await fetch("/cached/"+symbol);
+  const data=await response.json();
+
+  if(!response.ok){
+   throw new Error(data.detail || "No saved data");
+  }
+
+  showGex(data);
+
+  const hours=Math.floor((data.proxy_cache_age_seconds||0)/3600);
+  const minutes=Math.floor(((data.proxy_cache_age_seconds||0)%3600)/60);
+
+  $("notice").textContent=
+   "Saved data · Last successful update: "+hours+"h "+minutes+"m ago.";
+
+  $("status").textContent=data.proxy_stale
+   ? "Saved / stale"
+   : "Saved data";
+
+ }catch(err){
+  $("price").textContent="—";
+  $("flip").textContent="—";
+  $("netgex").textContent="—";
+  $("expiry").textContent="—";
+
+  $("levels").innerHTML=
+   '<tr><td colspan="2">No saved GEX data.</td></tr>';
+
+  $("notice").textContent=
+   "No saved data for "+symbol+". Press Refresh to request new data.";
+
+  $("status").textContent="No saved data";
+ }
+
+ $("marketLevels").innerHTML=
+  '<tr><td colspan="2">Press Refresh to load levels.</td></tr>';
 }
 
 async function loadData(){
  const symbol=$("ticker").value;
- $("status").textContent="Loading…";
+
+ $("status").textContent="Requesting FlashAlpha...";
  $("notice").textContent="";
- $("levels").innerHTML='<tr><td colspan="2">Loading…</td></tr>';
+ $("notice").classList.remove("error");
+
  setChart(symbol);
 
  try{
   const response=await fetch("/gex/"+symbol);
   const data=await response.json();
 
-  if(!response.ok) throw new Error(data.detail || "API error");
+  if(!response.ok){
+   throw new Error(data.detail || "API error");
+  }
 
-  $("price").textContent=number(data.underlying_price);
-  $("flip").textContent=number(data.gamma_flip);
-  $("netgex").textContent=compact(data.net_gex);
-  $("expiry").textContent=data.selected_expiration || "—";
-
-  renderRows(data);
+  showGex(data);
 
   if(data.proxy_stale){
-   const age=Math.round((data.proxy_cache_age_seconds||0)/3600);
-   $("notice").textContent="⚠ Showing cached data. Last successful update was about "+age+" hours ago.";
-   $("status").textContent="Cached / stale";
+   $("notice").textContent=
+    "FlashAlpha unavailable. Showing previously saved data.";
+   $("status").textContent="Saved / stale";
   }else{
-   $("status").textContent="Updated · "+new Date().toLocaleTimeString();
-   if(data.proxy_cache_age_seconds>0){
-    $("status").textContent="Cached · "+Math.round(data.proxy_cache_age_seconds/60)+" min old";
-   }
+   $("status").textContent="Updated successfully";
+   $("notice").textContent="Data received from FlashAlpha.";
   }
+
  }catch(err){
-  $("status").textContent="Error";
+  $("status").textContent="Update failed";
   $("notice").textContent="⚠ "+err.message;
   $("notice").classList.add("error");
+
+  // If refresh fails, try the last saved data.
+  await loadCachedData();
+  $("notice").textContent=
+   "⚠ "+err.message+" · Showing saved data if available.";
  }
 }
 
-$("ticker").addEventListener("change",loadData);
-loadData();
+async function loadMarketLevels(){
+ const symbol=$("ticker").value;
+
+ try{
+  const response=await fetch("/levels/"+symbol);
+  const data=await response.json();
+
+  if(!response.ok) throw new Error(data.detail || "Levels unavailable");
+
+  renderMarketLevels(data);
+ }catch(err){
+  $("marketLevels").innerHTML=
+   '<tr><td colspan="2">Levels unavailable: '+err.message+'</td></tr>';
+ }
+}
+
+$("ticker").addEventListener("change",loadCachedData);
+
+// Opening the dashboard only reads cached data.
+// It does NOT request new FlashAlpha data.
+loadCachedData();
 </script>
 </body>
 </html>
