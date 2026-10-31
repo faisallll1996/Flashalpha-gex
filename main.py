@@ -7,20 +7,26 @@ from typing import Dict, Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 
 API_BASE = "https://lab.flashalpha.com"
 API_KEY = os.getenv("FLASHALPHA_API_KEY", "").strip()
 
-ALLOWED = {"META", "MU", "TSLA", "AMD", "AVGO", "AAPL"}
-CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "900"))
+ALLOWED = {"META", "MU", "TSLA", "AMD", "AVGO", "SNDK"}
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "21600"))
 _cache: Dict[str, Any] = {}
 
-app = FastAPI(title="Equity GEX Proxy", version="2.0.0")
+app = FastAPI(title="GEX Dashboard", version="3.0.0")
 
 
 @app.get("/health")
 def health():
     return {"ok": True, "api_key_configured": bool(API_KEY)}
+
+
+@app.get("/symbols")
+def symbols():
+    return {"supported_symbols": sorted(ALLOWED)}
 
 
 async def request_api(path: str, params=None):
@@ -63,20 +69,50 @@ async def cached_request(path, key, params=None):
     if item and now - item["time"] < CACHE_TTL:
         return {
             **item["data"],
-            "proxy_cache_age_seconds": int(now - item["time"])
+            "proxy_cache_age_seconds": int(now - item["time"]),
+            "proxy_stale": False
         }
 
-    data = await request_api(path, params)
-    _cache[key] = {"time": now, "data": data}
+    try:
+        data = await request_api(path, params)
+        _cache[key] = {"time": now, "data": data}
+        return {
+            **data,
+            "proxy_cache_age_seconds": 0,
+            "proxy_stale": False
+        }
 
-    return {**data, "proxy_cache_age_seconds": 0}
+    except HTTPException:
+        if item:
+            return {
+                **item["data"],
+                "proxy_cache_age_seconds": int(now - item["time"]),
+                "proxy_stale": True
+            }
+        raise
 
 
 async def nearest_expiration(symbol: str):
-    options = await request_api(f"/v1/options/{symbol}")
+    cache_key = f"expirations:{symbol}"
+    now = time.time()
+    item = _cache.get(cache_key)
+
+    if item and now - item["time"] < CACHE_TTL:
+        options = item["data"]
+    else:
+        try:
+            options = await request_api(f"/v1/options/{symbol}")
+            _cache[cache_key] = {"time": now, "data": options}
+        except HTTPException:
+            if item:
+                options = item["data"]
+            else:
+                raise
 
     rows = options.get("expirations", [])
-    today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    today = datetime.now(
+        ZoneInfo("America/New_York")
+    ).date().isoformat()
 
     dates = sorted({
         row.get("expiration")
@@ -93,11 +129,6 @@ async def nearest_expiration(symbol: str):
     return dates[0]
 
 
-@app.get("/symbols")
-def symbols():
-    return {"supported_symbols": sorted(ALLOWED)}
-
-
 @app.get("/expirations/{symbol}")
 async def expirations(symbol: str):
     symbol = symbol.upper()
@@ -105,7 +136,10 @@ async def expirations(symbol: str):
     if symbol not in ALLOWED:
         raise HTTPException(400, "Unsupported symbol.")
 
-    return await request_api(f"/v1/options/{symbol}")
+    return await cached_request(
+        f"/v1/options/{symbol}",
+        f"expirations:{symbol}"
+    )
 
 
 @app.get("/gex/{symbol}")
@@ -148,3 +182,191 @@ async def levels(symbol: str):
         f"/v1/exposure/levels/{symbol}",
         f"levels:{symbol}"
     )
+
+
+DASHBOARD_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GEX Dashboard</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b1020;color:#e8edf7;font-family:Arial,sans-serif}
+header{padding:18px 16px;border-bottom:1px solid #273148}
+h1{font-size:22px;margin:0}
+.sub{color:#9ba9c2;font-size:12px;margin-top:6px}
+main{max-width:1100px;margin:auto;padding:15px}
+select,button{background:#18233a;color:white;border:1px solid #34435f;
+border-radius:9px;padding:12px;font-size:15px}
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+#status{font-size:12px;color:#9ba9c2}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.card{background:#131d31;border:1px solid #26344e;border-radius:13px;padding:15px;min-width:0}
+.card small{color:#9ba9c2;font-size:12px}
+.value{font-size:23px;font-weight:bold;margin-top:9px;overflow-wrap:anywhere}
+.chart{margin-top:14px;background:#131d31;border:1px solid #26344e;
+border-radius:13px;padding:10px}
+.chart h2{font-size:15px;margin:5px 5px 12px}
+iframe{width:100%;height:430px;border:0;border-radius:8px}
+.section{margin-top:15px}
+.section h2{font-size:16px}
+.notice{font-size:12px;color:#f4c66a;margin:12px 2px}
+.error{color:#ff8585}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:10px 7px;border-bottom:1px solid #26344e;text-align:right}
+th{color:#9ba9c2}
+td:first-child,th:first-child{text-align:left}
+.tablewrap{overflow-x:auto}
+@media(min-width:700px){.grid{grid-template-columns:repeat(4,1fr)}}
+</style>
+</head>
+<body>
+<header>
+<h1>GEX Dashboard</h1>
+<div class="sub">Gamma Exposure · Live chart · Cached data</div>
+</header>
+<main>
+<div class="toolbar">
+<select id="ticker">
+<option>META</option><option>MU</option><option>TSLA</option>
+<option>AMD</option><option>AVGO</option><option>SNDK</option>
+</select>
+<button onclick="loadData()">Refresh</button>
+<span id="status">Ready</span>
+</div>
+
+<div id="notice" class="notice"></div>
+
+<div class="grid">
+<div class="card"><small>Underlying Price</small><div class="value" id="price">—</div></div>
+<div class="card"><small>Gamma Flip</small><div class="value" id="flip">—</div></div>
+<div class="card"><small>Net GEX</small><div class="value" id="netgex">—</div></div>
+<div class="card"><small>Expiration</small><div class="value" id="expiry">—</div></div>
+</div>
+
+<div class="chart">
+<h2 id="chartTitle">META · TradingView</h2>
+<iframe id="tv"
+src="https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3AMETA&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=0&toolbarbg=0b1020&theme=dark&style=1&timezone=Asia%2FRiyadh&withdateranges=1&hideideas=1&studies=%5B%5D"
+allowtransparency="true" scrolling="no"></iframe>
+</div>
+
+<div class="section card">
+<h2>GEX Levels</h2>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Strike</th><th>Net GEX</th></tr></thead>
+<tbody id="levels"><tr><td colspan="2">Waiting for data…</td></tr></tbody>
+</table>
+</div>
+</div>
+<div class="sub" style="padding:15px 2px">
+Data provided by your FlashAlpha API proxy. Not investment advice.
+</div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function number(v){
+ if(v===null || v===undefined || v==="") return "—";
+ const n=Number(v);
+ if(!Number.isFinite(n)) return String(v);
+ return n.toLocaleString("en-US",{maximumFractionDigits:2});
+}
+
+function compact(v){
+ if(v===null || v===undefined || v==="") return "—";
+ const n=Number(v);
+ if(!Number.isFinite(n)) return String(v);
+ return n.toLocaleString("en-US",{notation:"compact",maximumFractionDigits:2});
+}
+
+function findRows(data){
+ const candidates = [
+  data.strikes, data.rows, data.data, data.exposures,
+  data.gex_by_strike, data.strike_data
+ ];
+ for(const item of candidates){
+  if(Array.isArray(item)) return item;
+ }
+ return [];
+}
+
+function renderRows(data){
+ const rows=findRows(data);
+ const body=$("levels");
+ if(!rows.length){
+  body.innerHTML='<tr><td colspan="2">No strike breakdown found in response.</td></tr>';
+  return;
+ }
+ const normalized=rows.map(r=>({
+  strike:r.strike ?? r.price ?? r.strike_price,
+  gex:r.net_gex ?? r.gex ?? r.total_gex ?? r.value
+ })).filter(r=>r.strike!==undefined);
+ normalized.sort((a,b)=>Number(a.strike)-Number(b.strike));
+ body.innerHTML=normalized.slice(0,30).map(r=>
+  `<tr><td>${number(r.strike)}</td><td>${compact(r.gex)}</td></tr>`
+ ).join("");
+}
+
+function setChart(symbol){
+ $("chartTitle").textContent=symbol+" · TradingView";
+ const url="https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3A"+
+ encodeURIComponent(symbol)+
+ "&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=0"+
+ "&toolbarbg=0b1020&theme=dark&style=1&timezone=Asia%2FRiyadh"+
+ "&withdateranges=1&hideideas=1";
+ $("tv").src=url;
+}
+
+async function loadData(){
+ const symbol=$("ticker").value;
+ $("status").textContent="Loading…";
+ $("notice").textContent="";
+ $("levels").innerHTML='<tr><td colspan="2">Loading…</td></tr>';
+ setChart(symbol);
+
+ try{
+  const response=await fetch("/gex/"+symbol);
+  const data=await response.json();
+
+  if(!response.ok) throw new Error(data.detail || "API error");
+
+  $("price").textContent=number(data.underlying_price);
+  $("flip").textContent=number(data.gamma_flip);
+  $("netgex").textContent=compact(data.net_gex);
+  $("expiry").textContent=data.selected_expiration || "—";
+
+  renderRows(data);
+
+  if(data.proxy_stale){
+   const age=Math.round((data.proxy_cache_age_seconds||0)/3600);
+   $("notice").textContent="⚠ Showing cached data. Last successful update was about "+age+" hours ago.";
+   $("status").textContent="Cached / stale";
+  }else{
+   $("status").textContent="Updated · "+new Date().toLocaleTimeString();
+   if(data.proxy_cache_age_seconds>0){
+    $("status").textContent="Cached · "+Math.round(data.proxy_cache_age_seconds/60)+" min old";
+   }
+  }
+ }catch(err){
+  $("status").textContent="Error";
+  $("notice").textContent="⚠ "+err.message;
+  $("notice").classList.add("error");
+ }
+}
+
+$("ticker").addEventListener("change",loadData);
+loadData();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    return HTMLResponse(DASHBOARD_HTML)
