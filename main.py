@@ -1,4 +1,3 @@
-
 import os
 import time
 import asyncio
@@ -17,7 +16,7 @@ ALLOWED = {"META", "MU", "TSLA", "AMD", "AVGO", "SNDK"}
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "21600"))
 _cache: Dict[str, Any] = {}
 
-app = FastAPI(title="GEX Dashboard", version="6.0.0")
+app = FastAPI(title="GEX Dashboard", version="6.1.0")
 
 
 @app.get("/health")
@@ -43,24 +42,34 @@ async def request_api(path: str, params=None):
             )
         except httpx.HTTPError as exc:
             raise HTTPException(
-                502, f"Upstream error: {exc.__class__.__name__}"
+                502, f"Upstream error: {exc.__class__.__name__}: {exc}"
             )
 
     if response.status_code == 401:
         raise HTTPException(502, "FlashAlpha rejected the API key.")
+
     if response.status_code == 403:
-        raise HTTPException(
-            403, "Plan does not allow this endpoint, symbol or expiration."
-        )
+        detail = response.text[:1000] or "FlashAlpha returned HTTP 403."
+        raise HTTPException(403, f"FlashAlpha access denied: {detail}")
+
     if response.status_code == 429:
         raise HTTPException(429, "FlashAlpha API quota reached.")
+
     if response.is_error:
-        raise HTTPException(502, f"FlashAlpha HTTP {response.status_code}")
+        detail = response.text[:1000] or "No error details returned."
+        raise HTTPException(
+            502, f"FlashAlpha HTTP {response.status_code}: {detail}"
+        )
 
     try:
-        return response.json()
+        payload = response.json()
     except ValueError:
         raise HTTPException(502, "Invalid JSON from FlashAlpha.")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(502, "Unexpected FlashAlpha response format.")
+
+    return payload
 
 
 async def cached_request(path, key, params=None):
@@ -115,6 +124,7 @@ async def nearest_expiration(symbol: str):
                 raise
 
     rows = options.get("expirations", [])
+
     today = datetime.now(
         ZoneInfo("America/New_York")
     ).date().isoformat()
@@ -244,13 +254,25 @@ async def refresh_all():
                 "data": levels_data
             }
 
-            return {"symbol": symbol, "status": "updated"}
+            return {
+                "symbol": symbol,
+                "status": "updated",
+                "expiration": expiration
+            }
+
+        except HTTPException as exc:
+            return {
+                "symbol": symbol,
+                "status": "failed",
+                "http_status": exc.status_code,
+                "error": str(exc.detail)
+            }
 
         except Exception as exc:
             return {
                 "symbol": symbol,
                 "status": "failed",
-                "error": str(exc)
+                "error": f"{type(exc).__name__}: {str(exc)}"
             }
 
     results = await asyncio.gather(
@@ -270,54 +292,30 @@ DASHBOARD_HTML = r"""
 
 <style>
 *{box-sizing:border-box}
-body{
- margin:0;background:#0b1020;color:#e8edf7;
- font-family:Arial,sans-serif
-}
+body{margin:0;background:#0b1020;color:#e8edf7;font-family:Arial,sans-serif}
 header{padding:18px 16px;border-bottom:1px solid #273148}
 h1{font-size:22px;margin:0}
 .sub{color:#9ba9c2;font-size:12px;margin-top:6px}
 main{max-width:1100px;margin:auto;padding:15px}
-select,button{
- background:#18233a;color:white;border:1px solid #34435f;
- border-radius:9px;padding:12px;font-size:15px
-}
+select,button{background:#18233a;color:white;border:1px solid #34435f;border-radius:9px;padding:12px;font-size:15px}
 button{cursor:pointer}
 button:hover{background:#263957}
-.toolbar{
- display:flex;gap:10px;align-items:center;
- flex-wrap:wrap;margin-bottom:14px
-}
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
 #status{font-size:12px;color:#9ba9c2}
-.grid{
- display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
- gap:10px
-}
-.card{
- background:#131d31;border:1px solid #26344e;
- border-radius:13px;padding:15px;min-width:0
-}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.card{background:#131d31;border:1px solid #26344e;border-radius:13px;padding:15px;min-width:0}
 .card small{color:#9ba9c2;font-size:12px}
-.value{
- font-size:23px;font-weight:bold;margin-top:9px;
- overflow-wrap:anywhere
-}
-.chart{
- margin-top:14px;background:#131d31;
- border:1px solid #26344e;border-radius:13px;padding:10px
-}
+.value{font-size:23px;font-weight:bold;margin-top:9px;overflow-wrap:anywhere}
+.chart{margin-top:14px;background:#131d31;border:1px solid #26344e;border-radius:13px;padding:10px}
 .chart h2{font-size:15px;margin:5px 5px 12px}
 iframe{width:100%;height:430px;border:0;border-radius:8px}
 .section{margin-top:15px}
 .section h2{font-size:16px}
-.notice{font-size:12px;color:#f4c66a;margin:12px 2px}
+.notice{font-size:12px;color:#f4c66a;margin:12px 2px;overflow-wrap:anywhere}
 .error{color:#ff8585}
 .trade-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 table{width:100%;border-collapse:collapse;font-size:13px}
-td,th{
- padding:10px 7px;border-bottom:1px solid #26344e;
- text-align:right
-}
+td,th{padding:10px 7px;border-bottom:1px solid #26344e;text-align:right}
 th{color:#9ba9c2}
 td:first-child,th:first-child{text-align:left}
 .tablewrap{overflow-x:auto}
@@ -374,6 +372,7 @@ td:first-child,th:first-child{text-align:left}
 
 <div class="section">
 <h2>Trade Plan</h2>
+
 <div class="grid trade-grid">
 <div class="card"><small>Entry</small><div class="value" id="entry">—</div></div>
 <div class="card"><small>Target 1</small><div class="value" id="target1">—</div></div>
@@ -386,6 +385,7 @@ td:first-child,th:first-child{text-align:left}
 <small id="liqBelow">Below: —</small>
 </div>
 </div>
+
 <div class="notice">
 Trade levels are calculated from available GEX strikes.
 They are reference levels, not guaranteed price targets.
@@ -426,6 +426,7 @@ allowtransparency="true" scrolling="no"></iframe>
 <div class="sub" style="padding:15px 2px">
 FlashAlpha data · TradingView chart · Not investment advice.
 </div>
+
 </main>
 
 <script>
@@ -452,9 +453,11 @@ function findRows(data){
   data.strikes,data.rows,data.data,data.exposures,
   data.gex_by_strike,data.strike_data
  ];
+
  for(const item of candidates){
   if(Array.isArray(item)) return item;
  }
+
  return [];
 }
 
@@ -477,6 +480,7 @@ function renderRows(data){
  }
 
  rows.sort((a,b)=>a.strike-b.strike);
+
  body.innerHTML=rows.slice(0,30).map(r=>
   `<tr><td>${number(r.strike)}</td><td>${compact(r.gex)}</td></tr>`
  ).join("");
@@ -507,12 +511,14 @@ function renderMarketLevels(data){
 
 function setChart(symbol){
  $("chartTitle").textContent=symbol+" · TradingView";
+
  const url=
   "https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3A"+
   encodeURIComponent(symbol)+
   "&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=0"+
   "&toolbarbg=0b1020&theme=dark&style=1&timezone=Asia%2FRiyadh"+
   "&withdateranges=1&hideideas=1";
+
  $("tv").src=url;
 }
 
@@ -538,6 +544,7 @@ function updateTradePlan(data){
 
  const above=rows.filter(r=>r.strike>spot)
   .sort((a,b)=>a.strike-b.strike);
+
  const below=rows.filter(r=>r.strike<spot)
   .sort((a,b)=>b.strike-a.strike);
 
@@ -558,8 +565,6 @@ function updateTradePlan(data){
  $("liqBelow").textContent="Below: "+(liqDown?number(liqDown.strike):"—");
 }
 
-
-// Browser storage keys
 function gexKey(symbol){
  return "flashalpha_gex_"+symbol;
 }
@@ -573,6 +578,7 @@ function saveBrowserData(symbol,gexData,levelsData){
   if(gexData){
    localStorage.setItem(gexKey(symbol),JSON.stringify(gexData));
   }
+
   if(levelsData){
    localStorage.setItem(levelsKey(symbol),JSON.stringify(levelsData));
   }
@@ -590,8 +596,6 @@ function readBrowserData(key){
  }
 }
 
-
-// LOAD MARKET LEVELS
 async function loadMarketLevels(){
  const symbol=$("ticker").value;
 
@@ -616,19 +620,18 @@ async function loadMarketLevels(){
    renderMarketLevels(saved);
   }else{
    $("marketLevels").innerHTML=
-    '<tr><td colspan="2">Levels unavailable</td></tr>';
+    '<tr><td colspan="2">Levels unavailable: '+err.message+'</td></tr>';
   }
  }
 }
 
-
-// LOAD SAVED DATA
 async function loadCachedData(){
  const symbol=$("ticker").value;
 
  $("status").textContent="Reading saved data...";
  $("notice").textContent="";
  $("notice").classList.remove("error");
+
  setChart(symbol);
 
  try{
@@ -648,6 +651,7 @@ async function loadCachedData(){
   await loadMarketLevels();
 
   const age=data.proxy_cache_age_seconds||0;
+
   $("notice").textContent=
    "Saved data · Last update: "+
    Math.floor(age/3600)+"h "+
@@ -664,6 +668,7 @@ async function loadCachedData(){
    updateTradePlan(saved);
 
    const savedLevels=readBrowserData(levelsKey(symbol));
+
    if(savedLevels){
     renderMarketLevels(savedLevels);
    }else{
@@ -673,6 +678,7 @@ async function loadCachedData(){
 
    $("notice").textContent=
     "Showing last browser-saved data. Press Refresh for latest data.";
+
    $("status").textContent="Browser saved data";
    return;
   }
@@ -684,6 +690,7 @@ async function loadCachedData(){
 
   $("levels").innerHTML=
    '<tr><td colspan="2">No saved GEX data.</td></tr>';
+
   $("marketLevels").innerHTML=
    '<tr><td colspan="2">No saved data.</td></tr>';
 
@@ -691,18 +698,18 @@ async function loadCachedData(){
 
   $("notice").textContent=
    "No saved data for "+symbol+". Press Refresh.";
+
   $("status").textContent="No saved data";
  }
 }
 
-
-// REFRESH ONE SYMBOL
 async function loadData(){
  const symbol=$("ticker").value;
 
  $("status").textContent="Requesting FlashAlpha...";
  $("notice").textContent="";
  $("notice").classList.remove("error");
+
  setChart(symbol);
 
  try{
@@ -717,8 +724,10 @@ async function loadData(){
   updateTradePlan(data);
 
   let levelsData=null;
+
   try{
    const lr=await fetch("/levels/"+symbol);
+
    if(lr.ok){
     levelsData=await lr.json();
     renderMarketLevels(levelsData);
@@ -738,12 +747,12 @@ async function loadData(){
   $("status").textContent="Update failed";
   $("notice").textContent="⚠ "+err.message;
   $("notice").classList.add("error");
-  await loadCachedData();
+
+  // Keep the actual error visible.
+  // Do not call loadCachedData() here.
  }
 }
 
-
-// REFRESH ALL SIX SYMBOLS
 async function refreshAll(){
  $("status").textContent="Refreshing all 6 symbols...";
  $("notice").textContent="";
@@ -763,31 +772,38 @@ async function refreshAll(){
 
   $("status").textContent=updated+"/6 symbols updated";
 
-  $("notice").textContent=failed.length
-   ? "Failed: "+failed.map(x=>x.symbol).join(", ")
-   : "All six symbols updated successfully.";
+  if(failed.length){
+   $("notice").classList.add("error");
 
-  // Retrieve and save the updated data for each successful symbol
+   $("notice").textContent=failed.map(x=>
+    x.symbol+": "+(x.error || "Unknown error")+
+    (x.http_status?" (HTTP "+x.http_status+")":"")
+   ).join(" | ");
+
+  }else{
+   $("notice").textContent=
+    "All six symbols updated successfully.";
+  }
+
   for(const item of results){
    if(item.status!=="updated") continue;
 
-   let gexData=null;
-   let levelsData=null;
-
    try{
     const gr=await fetch("/cached/"+item.symbol);
-    if(gr.ok) gexData=await gr.json();
-   }catch(e){}
+    const gexData=gr.ok?await gr.json():null;
 
-   try{
     const lr=await fetch("/levels/"+item.symbol);
-    if(lr.ok) levelsData=await lr.json();
-   }catch(e){}
+    const levelsData=lr.ok?await lr.json():null;
 
-   saveBrowserData(item.symbol,gexData,levelsData);
+    saveBrowserData(item.symbol,gexData,levelsData);
+
+   }catch(e){
+    console.error(item.symbol,e);
+   }
   }
 
-  await loadCachedData();
+  // Do not call loadCachedData() here.
+  // It would overwrite the detailed Refresh All error message.
 
  }catch(err){
   $("status").textContent="Refresh All failed";
@@ -796,15 +812,9 @@ async function refreshAll(){
  }
 }
 
-
-// SYMBOL SELECTION
 $("ticker").addEventListener("change",loadCachedData);
 
-
-// Opening dashboard reads server cache first,
-// then browser-saved data if server cache is empty.
 loadCachedData();
-
 </script>
 </body>
 </html>
