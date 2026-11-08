@@ -1,162 +1,106 @@
+
 import os
 import time
 import asyncio
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from typing import Dict, Any, Optional
+from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.responses import HTMLResponse
 
 API_BASE = "https://lab.flashalpha.com"
 API_KEY = os.getenv("FLASHALPHA_API_KEY", "").strip()
 
-ALLOWED = {"META", "MU", "TSLA", "AMD", "AVGO", "SNDK"}
-CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "21600"))
-REQUEST_DELAY = 1.5
+ALLOWED = ["META", "MU", "TSLA", "AMD", "AVGO", "SNDK"]
+MAX_DAILY_REQUESTS = 5
+CACHE_TTL = 21600
 
-_cache: Dict[str, Any] = {}
+app = FastAPI(title="GEX Dashboard", version="7.0.0")
 
-app = FastAPI(title="GEX Dashboard", version="6.2.0")
-
-
-@app.get("/health")
-def health():
-    return {"ok": True, "api_key_configured": bool(API_KEY)}
+cache = {}
+daily_requests = 0
+daily_date = datetime.now(timezone.utc).date()
+request_lock = asyncio.Lock()
 
 
-@app.get("/symbols")
-def symbols():
-    return {"supported_symbols": sorted(ALLOWED)}
+def reset_daily_counter():
+    global daily_requests, daily_date
+    today = datetime.now(timezone.utc).date()
+    if today != daily_date:
+        daily_requests = 0
+        daily_date = today
 
 
 async def request_api(path, params=None):
-    if not API_KEY:
-        raise HTTPException(503, "API key is not configured.")
+    global daily_requests
 
-    async with httpx.AsyncClient(timeout=25) as client:
-        try:
+    if not API_KEY:
+        raise HTTPException(503, "FLASHALPHA_API_KEY is not configured.")
+
+    async with request_lock:
+        reset_daily_counter()
+
+        if daily_requests >= MAX_DAILY_REQUESTS:
+            raise HTTPException(
+                429,
+                "Dashboard daily request limit reached (5). "
+                "Try again after the next UTC day."
+            )
+
+        daily_requests += 1
+
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
             response = await client.get(
                 f"{API_BASE}{path}",
                 headers={"X-Api-Key": API_KEY},
                 params=params
             )
-        except httpx.HTTPError as exc:
-            raise HTTPException(
-                502, f"Upstream connection error: {exc}"
-            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"FlashAlpha connection error: {exc}")
 
     if response.is_error:
-        detail = response.text[:1500] or "No response body."
-
-        retry_after = response.headers.get("Retry-After")
-        message = (
-            f"FlashAlpha HTTP {response.status_code}: {detail}"
-        )
-
-        if retry_after:
-            message += f" | Retry-After: {retry_after}"
-
+        detail = response.text[:1200]
+        retry = response.headers.get("Retry-After", "")
+        message = f"FlashAlpha HTTP {response.status_code}: {detail}"
+        if retry:
+            message += f" | Retry-After: {retry}"
         raise HTTPException(response.status_code, message)
 
     try:
-        payload = response.json()
+        data = response.json()
     except ValueError:
         raise HTTPException(502, "FlashAlpha returned invalid JSON.")
 
-    if not isinstance(payload, dict):
+    if not isinstance(data, dict):
         raise HTTPException(502, "Unexpected FlashAlpha response.")
 
-    return payload
+    return data
 
 
-async def cached_request(path, key, params=None):
-    now = time.time()
-    item = _cache.get(key)
-
-    if item and now - item["time"] < CACHE_TTL:
-        return {
-            **item["data"],
-            "proxy_cache_age_seconds": int(now - item["time"]),
-            "proxy_stale": False
-        }
-
-    try:
-        data = await request_api(path, params)
-        _cache[key] = {
-            "time": time.time(),
-            "data": data
-        }
-
-        return {
-            **data,
-            "proxy_cache_age_seconds": 0,
-            "proxy_stale": False
-        }
-
-    except HTTPException:
-        if item:
-            return {
-                **item["data"],
-                "proxy_cache_age_seconds": int(now - item["time"]),
-                "proxy_stale": True
-            }
-        raise
-
-
-async def nearest_expiration(symbol):
-    key = f"expirations:{symbol}"
-    now = time.time()
-    item = _cache.get(key)
-
-    if item and now - item["time"] < CACHE_TTL:
-        options = item["data"]
-    else:
-        options = await request_api(f"/v1/options/{symbol}")
-        _cache[key] = {
-            "time": time.time(),
-            "data": options
-        }
-
-    rows = options.get("expirations", [])
-
-    today = datetime.now(
-        ZoneInfo("America/New_York")
-    ).date().isoformat()
-
-    dates = sorted({
-        row.get("expiration")
-        for row in rows
-        if isinstance(row, dict)
-        and row.get("expiration", "") > today
-    })
-
-    if not dates:
-        raise HTTPException(
-            404, f"No future expiration found for {symbol}."
-        )
-
-    return dates[0]
-
-
-@app.get("/cached/{symbol}")
-def cached_gex(symbol: str):
+def validate_symbol(symbol):
     symbol = symbol.upper()
-
     if symbol not in ALLOWED:
         raise HTTPException(400, "Unsupported symbol.")
+    return symbol
 
+
+def save_gex(symbol, expiration, data):
+    cache[f"gex:{symbol}:{expiration}"] = {
+        "time": time.time(),
+        "data": data
+    }
+
+
+def get_saved_gex(symbol):
     matches = [
-        (key, value)
-        for key, value in _cache.items()
+        (key, item)
+        for key, item in cache.items()
         if key.startswith(f"gex:{symbol}:")
     ]
-
     if not matches:
-        raise HTTPException(
-            404, "No saved GEX data for this symbol yet."
-        )
+        return None
 
     key, item = max(matches, key=lambda x: x[1]["time"])
     age = int(time.time() - item["time"])
@@ -169,17 +113,54 @@ def cached_gex(symbol: str):
     }
 
 
+@app.get("/health")
+def health():
+    reset_daily_counter()
+    return {
+        "ok": True,
+        "api_key_configured": bool(API_KEY),
+        "requests_used_by_dashboard": daily_requests,
+        "requests_limit": MAX_DAILY_REQUESTS,
+        "utc_date": str(daily_date)
+    }
+
+
+@app.get("/symbols")
+def symbols():
+    return {"supported_symbols": ALLOWED}
+
+
+@app.get("/cached/{symbol}")
+def cached(symbol: str):
+    symbol = validate_symbol(symbol)
+    data = get_saved_gex(symbol)
+
+    if not data:
+        raise HTTPException(404, "No saved GEX data for this symbol yet.")
+
+    return data
+
+
 @app.get("/expirations/{symbol}")
 async def expirations(symbol: str):
-    symbol = symbol.upper()
+    symbol = validate_symbol(symbol)
 
-    if symbol not in ALLOWED:
-        raise HTTPException(400, "Unsupported symbol.")
+    data = await request_api(f"/v1/options/{symbol}")
+    rows = data.get("expirations", [])
 
-    return await cached_request(
-        f"/v1/options/{symbol}",
-        f"expirations:{symbol}"
-    )
+    today = datetime.now(timezone.utc).date().isoformat()
+    dates = sorted({
+        row.get("expiration")
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("expiration")
+        and row.get("expiration") > today
+    })
+
+    if not dates:
+        raise HTTPException(404, f"No future expiration found for {symbol}.")
+
+    return {"symbol": symbol, "expirations": dates}
 
 
 @app.get("/gex/{symbol}")
@@ -187,71 +168,87 @@ async def gex(
     symbol: str,
     expiration: Optional[str] = Query(default=None)
 ):
-    symbol = symbol.upper()
+    symbol = validate_symbol(symbol)
 
-    if symbol not in ALLOWED:
-        raise HTTPException(400, "Unsupported symbol.")
-
-    selected = expiration or await nearest_expiration(symbol)
+    if not expiration:
+        raise HTTPException(
+            400,
+            "Expiration is required. Use /expirations/{symbol} first."
+        )
 
     try:
-        datetime.strptime(selected, "%Y-%m-%d")
+        datetime.strptime(expiration, "%Y-%m-%d")
     except ValueError:
         raise HTTPException(400, "Expiration must be YYYY-MM-DD.")
 
-    data = await cached_request(
-        f"/v1/exposure/gex/{symbol}",
-        f"gex:{symbol}:{selected}",
-        params={"expiration": selected}
-    )
+    key = f"gex:{symbol}:{expiration}"
+    old = cache.get(key)
 
-    data["selected_expiration"] = selected
-    return data
+    if old and time.time() - old["time"] < CACHE_TTL:
+        return {
+            **old["data"],
+            "selected_expiration": expiration,
+            "proxy_cache_age_seconds": int(time.time() - old["time"]),
+            "proxy_stale": False
+        }
 
+    try:
+        data = await request_api(
+            f"/v1/exposure/gex/{symbol}",
+            params={"expiration": expiration}
+        )
+        save_gex(symbol, expiration, data)
 
-@app.get("/levels/{symbol}")
-async def levels(symbol: str):
-    symbol = symbol.upper()
+        return {
+            **data,
+            "selected_expiration": expiration,
+            "proxy_cache_age_seconds": 0,
+            "proxy_stale": False
+        }
 
-    if symbol not in ALLOWED:
-        raise HTTPException(400, "Unsupported symbol.")
-
-    return await cached_request(
-        f"/v1/exposure/levels/{symbol}",
-        f"levels:{symbol}"
-    )
+    except HTTPException:
+        if old:
+            return {
+                **old["data"],
+                "selected_expiration": expiration,
+                "proxy_cache_age_seconds": int(time.time() - old["time"]),
+                "proxy_stale": True
+            }
+        raise
 
 
 @app.post("/refresh-all")
-async def refresh_all():
+async def refresh_all(payload: dict = Body(default={})):
+    expirations_map = payload.get("expirations", {})
+    selected_symbols = payload.get("symbols", ALLOWED)
+
+    selected_symbols = [
+        s.upper() for s in selected_symbols
+        if s.upper() in ALLOWED
+    ]
+
     results = []
 
-    for symbol in sorted(ALLOWED):
+    for symbol in selected_symbols:
+        expiration = expirations_map.get(symbol)
+
+        if not expiration:
+            results.append({
+                "symbol": symbol,
+                "status": "skipped",
+                "error": "No saved expiration. Load expiration first."
+            })
+            continue
+
         try:
-            expiration = await nearest_expiration(symbol)
+            datetime.strptime(expiration, "%Y-%m-%d")
 
-            await asyncio.sleep(REQUEST_DELAY)
-
-            gex_data = await request_api(
+            data = await request_api(
                 f"/v1/exposure/gex/{symbol}",
                 params={"expiration": expiration}
             )
 
-            _cache[f"gex:{symbol}:{expiration}"] = {
-                "time": time.time(),
-                "data": gex_data
-            }
-
-            await asyncio.sleep(REQUEST_DELAY)
-
-            levels_data = await request_api(
-                f"/v1/exposure/levels/{symbol}"
-            )
-
-            _cache[f"levels:{symbol}"] = {
-                "time": time.time(),
-                "data": levels_data
-            }
+            save_gex(symbol, expiration, data)
 
             results.append({
                 "symbol": symbol,
@@ -264,50 +261,30 @@ async def refresh_all():
                 "symbol": symbol,
                 "status": "failed",
                 "http_status": exc.status_code,
-                "error": str(exc.detail),
-                "previous_data_kept": any(
-                    key.startswith(f"gex:{symbol}:")
-                    for key in _cache
-                )
+                "error": str(exc.detail)
             })
 
-            # Stop immediately on quota/rate-limit response.
-            # Do not waste requests on the remaining symbols.
             if exc.status_code == 429:
-                for remaining in sorted(ALLOWED):
-                    if remaining not in {
-                        item["symbol"] for item in results
-                    }:
-                        results.append({
-                            "symbol": remaining,
-                            "status": "skipped",
-                            "error": "Skipped because FlashAlpha returned HTTP 429."
-                        })
                 break
 
         except Exception as exc:
             results.append({
                 "symbol": symbol,
                 "status": "failed",
-                "error": f"{type(exc).__name__}: {exc}"
+                "error": str(exc)
             })
 
-        await asyncio.sleep(REQUEST_DELAY)
+    reset_daily_counter()
 
     return {
         "results": results,
-        "updated": sum(
-            1 for item in results
-            if item["status"] == "updated"
-        ),
-        "failed": sum(
-            1 for item in results
-            if item["status"] == "failed"
-        )
+        "updated": sum(x["status"] == "updated" for x in results),
+        "requests_used": daily_requests,
+        "requests_limit": MAX_DAILY_REQUESTS
     }
 
 
-DASHBOARD_HTML = r"""
+HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -317,41 +294,34 @@ DASHBOARD_HTML = r"""
 <style>
 *{box-sizing:border-box}
 body{margin:0;background:#0b1020;color:#e8edf7;font-family:Arial,sans-serif}
-header{padding:18px 16px;border-bottom:1px solid #273148}
+header{padding:18px;border-bottom:1px solid #273148}
 h1{font-size:22px;margin:0}
-.sub{color:#9ba9c2;font-size:12px;margin-top:6px}
 main{max-width:1100px;margin:auto;padding:15px}
-select,button{background:#18233a;color:white;border:1px solid #34435f;border-radius:9px;padding:12px;font-size:15px}
+.sub,small{color:#9ba9c2}
+.sub{font-size:12px;margin-top:6px}
+.toolbar{display:flex;gap:9px;flex-wrap:wrap;margin:14px 0}
+select,button{background:#18233a;color:white;border:1px solid #34435f;border-radius:9px;padding:12px;font-size:14px}
 button{cursor:pointer}
-.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
-#status{font-size:12px;color:#9ba9c2}
+#status{font-size:12px;color:#9ba9c2;align-self:center}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .card{background:#131d31;border:1px solid #26344e;border-radius:13px;padding:15px;min-width:0}
-.card small{color:#9ba9c2;font-size:12px}
-.value{font-size:23px;font-weight:bold;margin-top:9px;overflow-wrap:anywhere}
-.chart{margin-top:14px;background:#131d31;border:1px solid #26344e;border-radius:13px;padding:10px}
-.chart h2{font-size:15px;margin:5px 5px 12px}
-iframe{width:100%;height:430px;border:0;border-radius:8px}
-.section{margin-top:15px}
+.value{font-size:22px;font-weight:bold;margin-top:9px;overflow-wrap:anywhere}
+.section{margin-top:16px}
 .section h2{font-size:16px}
 .notice{font-size:12px;color:#f4c66a;margin:12px 2px;overflow-wrap:anywhere}
 .error{color:#ff8585}
-.trade-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 table{width:100%;border-collapse:collapse;font-size:13px}
 td,th{padding:10px 7px;border-bottom:1px solid #26344e;text-align:right}
-th{color:#9ba9c2}
 td:first-child,th:first-child{text-align:left}
 .tablewrap{overflow-x:auto}
-@media(min-width:700px){
-.grid{grid-template-columns:repeat(4,1fr)}
-.trade-grid{grid-template-columns:repeat(3,1fr)}
-}
+iframe{width:100%;height:430px;border:0;border-radius:8px}
+@media(min-width:700px){.grid{grid-template-columns:repeat(3,1fr)}}
 </style>
 </head>
 <body>
 <header>
 <h1>GEX Dashboard</h1>
-<div class="sub">Gamma Exposure · TradingView · Trade Plan</div>
+<div class="sub">Gamma Exposure · Trade Levels · TradingView</div>
 </header>
 <main>
 <div class="toolbar">
@@ -359,276 +329,239 @@ td:first-child,th:first-child{text-align:left}
 <option>META</option><option>MU</option><option>TSLA</option>
 <option>AMD</option><option>AVGO</option><option>SNDK</option>
 </select>
-<button onclick="loadData()">Refresh</button>
+<button onclick="loadSaved()">Load Saved</button>
+<button onclick="refreshOne()">Refresh</button>
 <button onclick="refreshAll()">Refresh All</button>
-<span id="status">Loading saved data...</span>
+<button onclick="loadExpiry()">Load Expiration</button>
+<span id="status">Loading...</span>
 </div>
+
 <div id="notice" class="notice"></div>
 
 <div class="grid">
 <div class="card"><small>Underlying Price</small><div class="value" id="price">—</div></div>
 <div class="card"><small>Gamma Flip</small><div class="value" id="flip">—</div></div>
-<div class="card"><small>Net GEX</small><div class="value" id="netgex">—</div></div>
+<div class="card"><small>Net GEX</small><div class="value" id="net">—</div></div>
 <div class="card"><small>Expiration</small><div class="value" id="expiry">—</div></div>
-</div>
-
-<div class="section">
-<h2>Trade Plan</h2>
-<div class="grid trade-grid">
-<div class="card"><small>Entry</small><div class="value" id="entry">—</div></div>
-<div class="card"><small>Target 1</small><div class="value" id="target1">—</div></div>
-<div class="card"><small>Target 2</small><div class="value" id="target2">—</div></div>
-<div class="card"><small>Target 3</small><div class="value" id="target3">—</div></div>
-<div class="card"><small>Stop Loss</small><div class="value" id="stopLoss">—</div></div>
-<div class="card"><small>Liquidity Above</small><div class="value" id="liqAbove">—</div><small id="liqBelow">Below: —</small></div>
-</div>
-<div class="notice">Trade levels are calculated from available GEX strikes. They are reference levels, not guaranteed price targets.</div>
-</div>
-
-<div class="chart">
-<h2 id="chartTitle">META · TradingView</h2>
-<iframe id="tv" src="https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3AMETA&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=0&toolbarbg=0b1020&theme=dark&style=1&timezone=Asia%2FRiyadh&withdateranges=1&hideideas=1" allowtransparency="true" scrolling="no"></iframe>
+<div class="card"><small>Entry Reference</small><div class="value" id="entry">—</div></div>
+<div class="card"><small>Stop Reference</small><div class="value" id="stop">—</div></div>
+<div class="card"><small>Target 1</small><div class="value" id="t1">—</div></div>
+<div class="card"><small>Target 2</small><div class="value" id="t2">—</div></div>
+<div class="card"><small>Target 3</small><div class="value" id="t3">—</div></div>
+<div class="card"><small>Liquidity Above</small><div class="value" id="above">—</div></div>
+<div class="card"><small>Liquidity Below</small><div class="value" id="below">—</div></div>
 </div>
 
 <div class="section card">
 <h2>GEX Strikes</h2>
-<div class="tablewrap"><table>
-<thead><tr><th>Strike</th><th>Net GEX</th></tr></thead>
-<tbody id="levels"><tr><td colspan="2">No saved data yet.</td></tr></tbody>
-</table></div>
+<div class="tablewrap">
+<table><thead><tr><th>Strike</th><th>Net GEX</th></tr></thead>
+<tbody id="rows"><tr><td colspan="2">No saved data.</td></tr></tbody></table>
+</div>
 </div>
 
 <div class="section card">
-<h2>Market Levels</h2>
-<div class="tablewrap"><table>
-<thead><tr><th>Level</th><th>Value</th></tr></thead>
-<tbody id="marketLevels"><tr><td colspan="2">Not loaded.</td></tr></tbody>
-</table></div>
+<h2>TradingView</h2>
+<iframe id="tv" src="https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3AMETA&interval=15&hidesidetoolbar=1&theme=dark&style=1&timezone=Asia%2FRiyadh" scrolling="no"></iframe>
 </div>
 
-<div class="sub" style="padding:15px 2px">FlashAlpha data · TradingView chart · Not investment advice.</div>
+<div class="notice">
+Trade levels are reference levels calculated from available GEX strikes. They are not guaranteed price targets or financial advice.
+</div>
 </main>
 
 <script>
 const $=id=>document.getElementById(id);
+const symbols=["META","MU","TSLA","AMD","AVGO","SNDK"];
 
-function number(v){
+function key(s){return "flashalpha_gex_"+s}
+function expKey(s){return "flashalpha_exp_"+s}
+
+function read(k){
+ try{return JSON.parse(localStorage.getItem(k)||"null")}catch(e){return null}
+}
+function save(s,d){
+ try{
+  localStorage.setItem(key(s),JSON.stringify(d));
+  if(d.selected_expiration)localStorage.setItem(expKey(s),d.selected_expiration);
+ }catch(e){}
+}
+function fmt(v){
  if(v===null||v===undefined||v==="")return "—";
- const n=Number(v);
+ let n=Number(v);
  return Number.isFinite(n)?n.toLocaleString("en-US",{maximumFractionDigits:2}):String(v);
 }
 function compact(v){
  if(v===null||v===undefined||v==="")return "—";
- const n=Number(v);
+ let n=Number(v);
  return Number.isFinite(n)?n.toLocaleString("en-US",{notation:"compact",maximumFractionDigits:2}):String(v);
 }
-function findRows(data){
- for(const item of [data.strikes,data.rows,data.data,data.exposures,data.gex_by_strike,data.strike_data]){
-  if(Array.isArray(item))return item;
- }
- return [];
+function getRows(d){
+ let a=d.strikes||d.rows||d.data||d.exposures||d.gex_by_strike||d.strike_data||[];
+ if(!Array.isArray(a))return [];
+ return a.map(x=>({
+  strike:Number(x.strike??x.price??x.strike_price),
+  gex:Number(x.net_gex??x.gex??x.total_gex??x.value)
+ })).filter(x=>Number.isFinite(x.strike)&&Number.isFinite(x.gex));
 }
-function normalizedRows(data){
- return findRows(data).map(r=>({
-  strike:Number(r.strike??r.price??r.strike_price),
-  gex:Number(r.net_gex??r.gex??r.total_gex??r.value)
- })).filter(r=>Number.isFinite(r.strike)&&Number.isFinite(r.gex));
+function render(d){
+ $("price").textContent=fmt(d.underlying_price);
+ $("flip").textContent=fmt(d.gamma_flip);
+ $("net").textContent=compact(d.net_gex);
+ $("expiry").textContent=d.selected_expiration||"—";
+
+ const rows=getRows(d).sort((a,b)=>a.strike-b.strike);
+ $("rows").innerHTML=rows.length?
+ rows.slice(0,40).map(x=>`<tr><td>${fmt(x.strike)}</td><td>${compact(x.gex)}</td></tr>`).join("")
+ :'<tr><td colspan="2">No strike breakdown in this API response.</td></tr>';
+
+ const spot=Number(d.underlying_price);
+ const up=rows.filter(x=>x.strike>spot).sort((a,b)=>a.strike-b.strike);
+ const down=rows.filter(x=>x.strike<spot).sort((a,b)=>b.strike-a.strike);
+
+ $("entry").textContent=fmt(spot);
+ $("stop").textContent=down[0]?fmt(down[0].strike):"—";
+ $("t1").textContent=up[0]?fmt(up[0].strike):"—";
+ $("t2").textContent=up[1]?fmt(up[1].strike):"—";
+ $("t3").textContent=up[2]?fmt(up[2].strike):"—";
+
+ const strongestUp=up.slice().sort((a,b)=>Math.abs(b.gex)-Math.abs(a.gex))[0];
+ const strongestDown=down.slice().sort((a,b)=>Math.abs(b.gex)-Math.abs(a.gex))[0];
+ $("above").textContent=strongestUp?fmt(strongestUp.strike):"—";
+ $("below").textContent=strongestDown?fmt(strongestDown.strike):"—";
 }
-function renderRows(data){
- const rows=normalizedRows(data);
- if(!rows.length){
-  $("levels").innerHTML='<tr><td colspan="2">No strike breakdown found.</td></tr>';
-  return;
- }
- rows.sort((a,b)=>a.strike-b.strike);
- $("levels").innerHTML=rows.slice(0,30).map(r=>
-  `<tr><td>${number(r.strike)}</td><td>${compact(r.gex)}</td></tr>`
- ).join("");
-}
-function renderMarketLevels(data){
- if(!data||typeof data!=="object"){
-  $("marketLevels").innerHTML='<tr><td colspan="2">No levels available.</td></tr>';
-  return;
- }
- const entries=Object.entries(data).filter(([k,v])=>
-  !["symbol","proxy_cache_age_seconds","proxy_stale"].includes(k)&&
-  (typeof v==="string"||typeof v==="number")
- );
- $("marketLevels").innerHTML=entries.length?
-  entries.slice(0,20).map(([k,v])=>
-   `<tr><td>${k.replaceAll("_"," ")}</td><td>${number(v)}</td></tr>`
-  ).join(""):
-  '<tr><td colspan="2">No levels available.</td></tr>';
-}
-function setChart(symbol){
- $("chartTitle").textContent=symbol+" · TradingView";
+function setChart(s){
  $("tv").src="https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3A"+
- encodeURIComponent(symbol)+
- "&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=0&toolbarbg=0b1020&theme=dark&style=1&timezone=Asia%2FRiyadh&withdateranges=1&hideideas=1";
+ encodeURIComponent(s)+
+ "&interval=15&hidesidetoolbar=1&theme=dark&style=1&timezone=Asia%2FRiyadh";
 }
-function showGex(data){
- $("price").textContent=number(data.underlying_price);
- $("flip").textContent=number(data.gamma_flip);
- $("netgex").textContent=compact(data.net_gex);
- $("expiry").textContent=data.selected_expiration||"—";
- renderRows(data);
-}
-function updateTradePlan(data){
- const spot=Number(data.underlying_price);
- const rows=normalizedRows(data);
- if(!Number.isFinite(spot)){
-  ["entry","target1","target2","target3","stopLoss","liqAbove","liqBelow"].forEach(id=>$(id).textContent="—");
-  return;
- }
- $("entry").textContent=number(spot);
- const above=rows.filter(r=>r.strike>spot).sort((a,b)=>a.strike-b.strike);
- const below=rows.filter(r=>r.strike<spot).sort((a,b)=>b.strike-a.strike);
- $("target1").textContent=above[0]?number(above[0].strike):"—";
- $("target2").textContent=above[1]?number(above[1].strike):"—";
- $("target3").textContent=above[2]?number(above[2].strike):"—";
- $("stopLoss").textContent=below[0]?number(below[0].strike):"—";
- const up=above.slice().sort((a,b)=>Math.abs(b.gex)-Math.abs(a.gex))[0];
- const down=below.slice().sort((a,b)=>Math.abs(b.gex)-Math.abs(a.gex))[0];
- $("liqAbove").textContent=up?number(up.strike):"—";
- $("liqBelow").textContent="Below: "+(down?number(down.strike):"—");
-}
-function gexKey(s){return "flashalpha_gex_"+s}
-function levelsKey(s){return "flashalpha_levels_"+s}
-function saveBrowserData(s,g,l){
- try{
-  if(g)localStorage.setItem(gexKey(s),JSON.stringify(g));
-  if(l)localStorage.setItem(levelsKey(s),JSON.stringify(l));
- }catch(e){}
-}
-function readBrowserData(k){
- try{return JSON.parse(localStorage.getItem(k)||"null")}catch(e){return null}
-}
-async function loadMarketLevels(){
- const s=$("ticker").value;
- try{
-  const r=await fetch("/levels/"+s);
-  const d=await r.json();
-  if(!r.ok)throw new Error(d.detail||"Levels unavailable");
-  localStorage.setItem(levelsKey(s),JSON.stringify(d));
-  renderMarketLevels(d);
- }catch(e){
-  const saved=readBrowserData(levelsKey(s));
-  if(saved)renderMarketLevels(saved);
-  else $("marketLevels").innerHTML='<tr><td colspan="2">Levels unavailable: '+e.message+'</td></tr>';
- }
-}
-async function loadCachedData(){
- const s=$("ticker").value;
- $("status").textContent="Reading saved data...";
- $("notice").textContent="";
- $("notice").classList.remove("error");
+function selected(){return $("ticker").value}
+
+async function loadSaved(){
+ const s=selected();
  setChart(s);
+ const local=read(key(s));
+ if(local){
+  render(local);
+  $("status").textContent="Browser saved data";
+  $("notice").textContent="Showing the last data saved in this browser.";
+ }
  try{
   const r=await fetch("/cached/"+s);
   const d=await r.json();
-  if(!r.ok)throw new Error(d.detail||"No saved data");
-  localStorage.setItem(gexKey(s),JSON.stringify(d));
-  showGex(d);
-  updateTradePlan(d);
-  await loadMarketLevels();
-  const age=d.proxy_cache_age_seconds||0;
-  $("notice").textContent="Saved data · Last update: "+Math.floor(age/3600)+"h "+Math.floor((age%3600)/60)+"m ago.";
-  $("status").textContent=d.proxy_stale?"Saved / stale":"Saved data";
- }catch(e){
-  const saved=readBrowserData(gexKey(s));
-  if(saved){
-   showGex(saved);
-   updateTradePlan(saved);
-   const l=readBrowserData(levelsKey(s));
-   if(l)renderMarketLevels(l);
-   $("notice").textContent="Showing last browser-saved data. Press Refresh for latest data.";
-   $("status").textContent="Browser saved data";
+  if(r.ok){
+   save(s,d);render(d);
+   $("status").textContent="Saved server data";
+   $("notice").textContent="Saved data loaded.";
    return;
   }
-  $("price").textContent="—";
-  $("flip").textContent="—";
-  $("netgex").textContent="—";
-  $("expiry").textContent="—";
-  $("levels").innerHTML='<tr><td colspan="2">No saved GEX data.</td></tr>';
-  $("marketLevels").innerHTML='<tr><td colspan="2">No saved data.</td></tr>';
-  updateTradePlan({});
-  $("notice").textContent="No saved data for "+s+". No successful update has been saved yet.";
+ }catch(e){}
+ if(!local){
   $("status").textContent="No saved data";
+  $("notice").textContent="No saved data for "+s+". Load expiration, then refresh.";
  }
 }
-async function loadData(){
- const s=$("ticker").value;
- $("status").textContent="Requesting FlashAlpha...";
- $("notice").textContent="";
- $("notice").classList.remove("error");
- setChart(s);
+async function loadExpiry(){
+ const s=selected();
+ $("status").textContent="Loading expiration...";
  try{
-  const r=await fetch("/gex/"+s);
+  const r=await fetch("/expirations/"+s);
   const d=await r.json();
-  if(!r.ok)throw new Error(d.detail||"API error");
-  showGex(d);
-  updateTradePlan(d);
-  let l=null;
-  try{
-   const lr=await fetch("/levels/"+s);
-   if(lr.ok){l=await lr.json();renderMarketLevels(l)}
-  }catch(e){}
-  saveBrowserData(s,d,l);
-  $("status").textContent=d.proxy_stale?"Saved / stale":"Updated successfully";
-  $("notice").textContent=d.proxy_stale?"FlashAlpha unavailable. Showing saved data.":"Data received from FlashAlpha.";
+  if(!r.ok)throw new Error(d.detail||"Expiration request failed");
+  const chosen=d.expirations[0];
+  localStorage.setItem(expKey(s),chosen);
+  $("status").textContent="Expiration saved";
+  $("notice").textContent=s+" expiration saved: "+chosen;
+ }catch(e){
+  $("status").textContent="Failed";
+  $("notice").textContent=e.message;
+  $("notice").classList.add("error");
+ }
+}
+async function refreshOne(){
+ const s=selected();
+ let expiration=localStorage.getItem(expKey(s));
+ const old=read(key(s));
+ if(!expiration&&old)expiration=old.selected_expiration;
+ if(!expiration){
+  $("notice").textContent="No saved expiration. Press Load Expiration first.";
+  return;
+ }
+ $("status").textContent="Refreshing "+s+"...";
+ try{
+  const r=await fetch("/gex/"+s+"?expiration="+encodeURIComponent(expiration));
+  const d=await r.json();
+  if(!r.ok)throw new Error(d.detail||"Refresh failed");
+  save(s,d);render(d);
+  $("status").textContent="Updated "+s;
+  $("notice").textContent="Latest GEX data received.";
  }catch(e){
   $("status").textContent="Update failed";
-  $("notice").textContent="⚠ "+e.message;
+  $("notice").textContent=e.message;
   $("notice").classList.add("error");
-  const saved=readBrowserData(gexKey(s));
-  if(saved){
-   showGex(saved);
-   updateTradePlan(saved);
-   const l=readBrowserData(levelsKey(s));
-   if(l)renderMarketLevels(l);
-  }
+  if(old)render(old);
  }
 }
 async function refreshAll(){
- $("status").textContent="Refreshing symbols one by one...";
- $("notice").textContent="Please wait. Requests are sent sequentially.";
+ const known={};
+ for(const s of symbols){
+  const d=read(key(s));
+  const e=localStorage.getItem(expKey(s))||(d&&d.selected_expiration);
+  if(e)known[s]=e;
+ }
+ const available=symbols.filter(s=>known[s]);
+ if(!available.length){
+  $("notice").textContent="No saved expiration dates. Load expiration for the symbols first.";
+  return;
+ }
+ let start=Number(localStorage.getItem("flashalpha_rotation")||0)%available.length;
+ const ordered=available.slice(start).concat(available.slice(0,start));
+ const batch=ordered.slice(0,5);
+ localStorage.setItem("flashalpha_rotation",String((start+5)%available.length));
+
+ $("status").textContent="Refreshing up to 5 symbols...";
+ $("notice").textContent="Sending one GEX request per selected symbol.";
  $("notice").classList.remove("error");
+
  try{
-  const r=await fetch("/refresh-all",{method:"POST"});
+  const r=await fetch("/refresh-all",{
+   method:"POST",
+   headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({
+    symbols:batch,
+    expirations:known
+   })
+  });
   const d=await r.json();
-  if(!r.ok)throw new Error(d.detail||"Refresh failed");
-  const results=d.results||[];
-  const updated=results.filter(x=>x.status==="updated").length;
-  const failed=results.filter(x=>x.status==="failed");
-  const skipped=results.filter(x=>x.status==="skipped");
-  $("status").textContent=updated+"/6 symbols updated";
-  if(failed.length||skipped.length){
-   $("notice").classList.add("error");
-   $("notice").textContent=results.filter(x=>x.status!=="updated").map(x=>
-    x.symbol+": "+(x.error||"Failed")+
-    (x.http_status?" (HTTP "+x.http_status+")":"")
-   ).join(" | ");
-  }else{
-   $("notice").textContent="All six symbols updated successfully.";
+  if(!r.ok)throw new Error(d.detail||"Refresh All failed");
+
+  for(const item of d.results||[]){
+   if(item.status==="updated"){
+    try{
+     const cr=await fetch("/cached/"+item.symbol);
+     if(cr.ok){
+      const saved=await cr.json();
+      save(item.symbol,saved);
+     }
+    }catch(e){}
+   }
   }
-  for(const item of results){
-   if(item.status!=="updated")continue;
-   try{
-    const gr=await fetch("/cached/"+item.symbol);
-    const g=gr.ok?await gr.json():null;
-    const lr=await fetch("/levels/"+item.symbol);
-    const l=lr.ok?await lr.json():null;
-    saveBrowserData(item.symbol,g,l);
-   }catch(e){}
-  }
+
+  const failed=(d.results||[]).filter(x=>x.status!=="updated");
+  $("status").textContent=d.updated+" symbols updated";
+  $("notice").textContent=failed.length?
+   failed.map(x=>x.symbol+": "+x.error).join(" | "):
+   "Refresh completed successfully.";
+  if(failed.length)$("notice").classList.add("error");
+  loadSaved();
  }catch(e){
   $("status").textContent="Refresh All failed";
-  $("notice").textContent="⚠ "+e.message;
+  $("notice").textContent=e.message;
   $("notice").classList.add("error");
  }
 }
-$("ticker").addEventListener("change",loadCachedData);
-loadCachedData();
+$("ticker").addEventListener("change",loadSaved);
+loadSaved();
 </script>
 </body>
 </html>
@@ -637,4 +570,4 @@ loadCachedData();
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    return HTMLResponse(DASHBOARD_HTML)
+    return HTMLResponse(HTML)
